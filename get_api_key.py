@@ -1,91 +1,114 @@
-#
-# Copyright © 2020 Maestro Creativescape
-#
-# SPDX-License-Identifier: GPL-3.0
-#
+import os
+import hashlib
+import requests
+import subprocess
+from github import Github
 
-from selenium import webdriver
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver import ActionChains
-from time import sleep
-import re
-from os import remove
-from os import environ
-from dotenv import load_dotenv
-import sentry_sdk
-from sentry_sdk import capture_exception
+auth = Github("$USERNAME", "$PASSWORD")
 
-sentry_sdk.init("https://8a6cee16d17a43ec916bafc296b61110@sentry.io/2240523")
-# Run Chrome Headless
-try:
-    load_dotenv("config.env")
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--window-size=1920x1080")
-
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.implicitly_wait(30)
-
-    # Grab the current window
-    main_window_handle = None
-    while not main_window_handle:
-        main_window_handle = driver.current_window_handle
-
-    driver.get("http://api.xda-developers.com/explorer/")
-    que=driver.find_element_by_id('login_btn')
-    que.click()
-
-    # Swap to signin window
-    signin_window_handle = None
-    while not signin_window_handle:
-        for handle in driver.window_handles:
-            if handle != main_window_handle:
-                signin_window_handle = handle
-                break
-    driver.switch_to.window(signin_window_handle)
+def runSh(command):
+    try:
+        command = command.split(' ')
+        command = filter(None, command)
+        command = list(command)
+        if not len(command):
+            raise Exception("Not a valid command.")
+        subprocess.call(command)
+    except Exception as e:
+        print(f"runSh failed:", e)
 
 
-    username = driver.find_element_by_name("username")
-    password = driver.find_element_by_name("password")
-    submit = driver.find_element_by_id("signin-submit")
-    username.send_keys(environ.get("XDA_USERNAME"))
-    password.send_keys(environ.get("XDA_PASSWORD"))
-    submit.click()
-    driver.implicitly_wait(3)
-    confirm_btn = driver.find_element_by_id("authorize")
-    confirm_btn.click()
+def runShAndReturnStdout(command):
+    try:
+        command = command.split(' ')
+        command = filter(None, command)
+        command = list(command)
+        if not len(command):
+            raise Exception("Not a valid command.")
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE)
+        output = proc.stdout.read().decode()
+        return output
+    except Exception as e:
+        print(f"runShAndReturnStdout failed:", e)
 
-    # Come back to main window
-    driver.switch_to.window(main_window_handle)
-    driver.implicitly_wait(3)
 
-    #Scrape out the API Key
-    page = driver.page_source
-    f = open("page_sauce.txt", "w")
-    f.write(page)
-    f.close()
+def auth_request(url, method='POST', data={}, validResponseCodes=200, validResponseContent='OK', ReturnStdout=False):
+    req = requests.post if method == 'POST' else requests.get
+    headers = {'web-api-key': API_KEY}
+    response = req(url, data, headers=headers)
 
-    for line in open("page_sauce.txt", 'r'):
-        if re.search("Access token:", line):
-            token_line = line
-            break
+    if validResponseCodes != response.status_code:
+        raise Exception(
+            f"Cannot get a validate the status code for the requested resource.\n\nExpected {validResponseCode} and recieved {response.status_text}")
 
-    remove("page_sauce.txt")
-    token = token_line.split(" ")[5]
-    token = token[:40]
-    print("API-TOKEN: ",token)
+    if validResponseContent:
+        if validResponseContent != response.text:
+            raise Exception(
+                f"Cannot get a validate the output result for the requested resource.\n\nExpected {validResponseContent} and recieved {response.text}")
 
-    environ["XDA_API_TOKEN"] = str(token)
+    if ReturnStdout:
+        return response
 
-    # close the browser window
-    driver.quit()
+def logUpload():
+    org_name = "PixysOS-Devices"
+    repo_name = "jenkins_console"
+    org = auth.get_organization(org_name)
+    repo = org.get_repo(repo_name)
+    try:
+        release = repo.create_git_release("$uid", "$BUILD_NUMBER", f"Console text for build number #$BUILD_NUMBER")
+        release.upload_asset("release/build.log")
+    except:
+        pass
 
-except BaseException as e:
-    driver.quit()
-    x = capture_exception(e)
-    msg="Extraction of API Key Failed!\n" \
-        "The developer was notified.\n" \
-        "Error: "+str(type(e).__name__) + "\n" \
-        "Error ID: "  + x
-    print(msg)
+def buildUpload(resp):
+    value = 0
+    device = resp['device']
+    filehash = resp['filehash']
+    timestamp = resp['timestamp']
+
+    org_name = hashlib.md5("pixys-releases".encode('utf-8')).hexdigest()
+    repo_name = hashlib.md5(device.encode('utf-8')).hexdigest()
+    org = auth.get_organization(org_name)
+
+    try:
+        repo = org.get_repo(repo_name)
+    except:
+        org.create_repo(repo_name)
+        repo = org.get_repo(repo_name)
+        repo.create_file("placeholder", "Create placeholder", repo_name)
+    
+    try:
+        release = repo.create_git_release(timestamp, filehash, filehash)
+    except:
+        releases = repo.get_releases()
+        release = next((r for r in releases if r.tag_name == timestamp), None)
+
+    try:
+        release.upload_asset(filehash + ".zip")
+        value = 1
+    except:
+    
+    return value
+
+def generateOTA():
+    e = os.environ
+    response = {}
+    info['device'] = e.get('device')
+    info['edition'] = e.get('edition')
+    info['base'] = e.get('base')
+    info['release'] = "official" if e.get('test_branch') != 'yes' and e.get('variant') != 'eng' else "unofficial"
+    info['filename'] = runShAndReturnStdout("cat build.prop | sed -n -e 's/^.*ro.pixys.version=//p'") + '.zip'
+    info['filehash'] = runShAndReturnStdout("md5sum " + info['filename'] + " | cut -d ' ' -f 1")
+    info['filesize'] = runShAndReturnStdout("cat " + info['filename'] + " | wc -c")
+    info['filepath'] = info['device'] + '/' + info['base'] + '/' + info['edition']
+    info['version'] = runShAndReturnStdout("cat build.prop | sed -n -e 's/^.*ro.modversion=//p'")
+    info['timestamp'] = runShAndReturnStdout("cat build.prop | sed -n -e 's/^.*ro.pixys.build.date=//p'")
+    
+    return response
+
+def sendBuild():
+    resp = generateOTA()
+    response = buildUpload(resp)
+    
+    if not response:
+        pass
